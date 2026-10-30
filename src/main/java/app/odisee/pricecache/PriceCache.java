@@ -31,16 +31,27 @@ public final class PriceCache {
         }
     }
 
-    /** Returns the cached price, loading it when missing or expired. */
+    /**
+     * Returns the cached price, loading it when missing or expired.
+     *
+     * <p>Fresh hits are a lock-free read. A miss or an expired entry is loaded inside
+     * {@link ConcurrentHashMap#compute}, which runs at most one remapping per key at a
+     * time, so concurrent callers for the same SKU wait for one load and share its
+     * result. A loader exception propagates and leaves the mapping unchanged.
+     */
     public Price get(String sku) {
         Objects.requireNonNull(sku, "sku");
-        Instant now = clock.instant();
-        Entry entry = entries.get(sku);
-        if (entry == null || !now.isBefore(entry.expiresAt())) {
-            Price loaded = loader.apply(sku);
-            entry = new Entry(loaded, now.plus(ttl));
-            entries.put(sku, entry);
+        Entry cached = entries.get(sku);
+        if (cached != null && clock.instant().isBefore(cached.expiresAt())) {
+            return cached.price();
         }
+        Entry entry = entries.compute(sku, (key, current) -> {
+            Instant now = clock.instant();
+            if (current != null && now.isBefore(current.expiresAt())) {
+                return current; // another thread loaded it while we waited
+            }
+            return new Entry(loader.apply(key), now.plus(ttl));
+        });
         return entry.price();
     }
 
